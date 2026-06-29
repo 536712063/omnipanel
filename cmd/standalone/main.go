@@ -75,7 +75,27 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open embedded dist: %v", err)
 	}
-	http.Handle("/", http.FileServer(http.FS(distSub)))
+	fileServer := http.FileServer(http.FS(distSub))
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		// 检查静态文件是否存在
+		if path != "/" {
+			f, err := distSub.Open(path[1:])
+			if err == nil {
+				f.Close()
+				w.Header().Set("Cache-Control", "public, max-age=3600")
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// SPA 回退: 非 API 路径全部返回 index.html
+		w.Header().Set("Cache-Control", "no-cache")
+		r.URL.Path = "/"
+		fileServer.ServeHTTP(w, r)
+	})
 
 	port := "27180"
 	if p := os.Getenv("OMNIPANEL_PORT"); p != "" {
