@@ -1,0 +1,257 @@
+syntax = "proto3";
+
+package omnipanel.sdt.v1;
+
+option go_package = "github.com/omnipanel/omnipanel/proto/sdt/v1;sdtv1";
+
+import "common/v1/common.proto";
+
+// ---------------------------------------------------------------------------
+// SDTD 七日杀专用插件 gRPC 服务定义
+// 该插件作为独立进程运行，通过 go-plugin 与 Agent 主进程通信
+// ---------------------------------------------------------------------------
+
+service SDTService {
+  // ---------- 服务端生命周期 ----------
+  rpc InstallServer(InstallServerRequest) returns (stream omnipanel.common.v1.LogEntry);
+  rpc StartServer(omnipanel.common.v1.Empty) returns (omnipanel.common.v1.StatusResponse);
+  rpc StopServer(omnipanel.common.v1.Empty) returns (omnipanel.common.v1.StatusResponse);
+  rpc RestartServer(omnipanel.common.v1.Empty) returns (omnipanel.common.v1.StatusResponse);
+  rpc GetServerStatus(omnipanel.common.v1.Empty) returns (ServerStatusResponse);
+
+  // ---------- 控制台 ----------
+  rpc SendConsoleCommand(ConsoleCommandRequest) returns (ConsoleCommandResponse);
+  rpc StreamConsole(omnipanel.common.v1.StreamRequest) returns (stream ConsoleLine);
+
+  // ---------- 配置文件 CRUD ----------
+  rpc GetServerConfig(omnipanel.common.v1.Empty) returns (ServerConfig);
+  rpc UpdateServerConfig(UpdateServerConfigRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc ValidateConfig(omnipanel.common.v1.Empty) returns (ValidationResult);
+
+  // ---------- 玩家管理 ----------
+  rpc ListPlayers(omnipanel.common.v1.Empty) returns (PlayerList);
+  rpc KickPlayer(KickPlayerRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc BanPlayer(BanPlayerRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc UnbanPlayer(UnbanPlayerRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc TeleportPlayer(TeleportPlayerRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc GiveItem(GiveItemRequest) returns (omnipanel.common.v1.StatusResponse);
+
+  // ---------- 白名单 ----------
+  rpc ListWhitelist(omnipanel.common.v1.Empty) returns (WhitelistResponse);
+  rpc AddWhitelist(WhitelistEntry) returns (omnipanel.common.v1.StatusResponse);
+  rpc RemoveWhitelist(WhitelistEntry) returns (omnipanel.common.v1.StatusResponse);
+
+  // ---------- 管理员 ----------
+  rpc ListAdmins(omnipanel.common.v1.Empty) returns (AdminList);
+  rpc AddAdmin(AdminEntry) returns (omnipanel.common.v1.StatusResponse);
+  rpc RemoveAdmin(AdminEntry) returns (omnipanel.common.v1.StatusResponse);
+
+  // ---------- 存档备份 ----------
+  rpc CreateBackup(omnipanel.common.v1.Empty) returns (BackupResponse);
+  rpc ListBackups(omnipanel.common.v1.Empty) returns (BackupList);
+  rpc RestoreBackup(RestoreBackupRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc DeleteBackup(DeleteBackupRequest) returns (omnipanel.common.v1.StatusResponse);
+
+  // ---------- MOD 管理 ----------
+  rpc ListMods(omnipanel.common.v1.Empty) returns (ModList);
+  rpc InstallMod(InstallModRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc RemoveMod(RemoveModRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc ToggleMod(ToggleModRequest) returns (omnipanel.common.v1.StatusResponse);
+
+  // ---------- 实时监控 ----------
+  rpc StreamMetrics(omnipanel.common.v1.StreamRequest) returns (stream ServerMetrics);
+}
+
+// ===========================================================================
+// 消息定义
+// ===========================================================================
+
+message InstallServerRequest {
+  string install_dir = 1;
+  string steam_username = 2;
+  string steam_password = 3;
+  bool force_reinstall = 4;
+}
+
+message ServerStatusResponse {
+  bool installed = 1;
+  bool running = 2;
+  int32 pid = 3;
+  string version = 4;
+  int32 online_players = 5;
+  int32 max_players = 6;
+  double tps = 7;
+  int32 fps = 8;
+  uint64 memory_mb = 9;
+  string uptime = 10;
+}
+
+message ServerConfig {
+  string server_name = 1;
+  string server_description = 2;
+  string server_password = 3;
+  int32 server_max_player_count = 4;
+  int32 server_port = 5;
+  int32 server_visibility = 6;
+  int32 game_difficulty = 7;
+  string game_mode = 8;
+  string world_gen_seed = 9;
+  int32 world_gen_size = 10;
+  int32 day_night_length = 11;
+  int32 max_spawned_zombies = 12;
+  int32 max_spawned_animals = 13;
+  bool eac_enabled = 14;
+  int32 blood_moon_frequency = 15;
+  int32 air_drop_frequency = 16;
+  int32 drop_on_death = 17;
+  int32 drop_on_quit = 18;
+  bool telnet_enabled = 19;
+  int32 telnet_port = 20;
+  string telnet_password = 21;
+}
+
+message UpdateServerConfigRequest {
+  ServerConfig config = 1;
+  bool apply_immediately = 2;
+}
+
+message ConsoleCommandRequest {
+  string command = 1;
+}
+
+message ConsoleCommandResponse {
+  string output = 1;
+  bool success = 2;
+}
+
+message ConsoleLine {
+  string timestamp = 1;
+  string level = 2;
+  string message = 3;
+}
+
+message Player {
+  string name = 1;
+  string steam_id = 2;
+  string play_time = 3;
+  int32 level = 4;
+  int32 score = 5;
+  bool online = 6;
+  bool banned = 7;
+  string ip_address = 8;
+}
+
+message PlayerList {
+  repeated Player players = 1;
+}
+
+message KickPlayerRequest {
+  string steam_id = 1;
+  string reason = 2;
+}
+
+message BanPlayerRequest {
+  string steam_id = 1;
+  string reason = 2;
+  int32 duration_hours = 3;
+}
+
+message UnbanPlayerRequest {
+  string steam_id = 1;
+}
+
+message TeleportPlayerRequest {
+  string steam_id = 1;
+  double x = 2;
+  double y = 3;
+  double z = 4;
+}
+
+message GiveItemRequest {
+  string steam_id = 1;
+  string item_name = 2;
+  int32 quantity = 3;
+  int32 quality = 4;
+}
+
+message WhitelistEntry {
+  string steam_id = 1;
+  string name = 2;
+}
+
+message WhitelistResponse {
+  bool enabled = 1;
+  repeated WhitelistEntry entries = 2;
+}
+
+message AdminEntry {
+  string steam_id = 1;
+  int32 permission_level = 2;
+  string name = 3;
+}
+
+message AdminList {
+  repeated AdminEntry admins = 1;
+}
+
+message ValidationResult {
+  bool valid = 1;
+  repeated string errors = 2;
+  repeated string warnings = 3;
+}
+
+message BackupResponse {
+  string id = 1;
+  string name = 2;
+  string size = 3;
+  string created_at = 4;
+}
+
+message BackupList {
+  repeated BackupResponse backups = 1;
+}
+
+message RestoreBackupRequest {
+  string backup_id = 1;
+}
+
+message DeleteBackupRequest {
+  string backup_id = 1;
+}
+
+message ModInfo {
+  string name = 1;
+  string version = 2;
+  string author = 3;
+  bool enabled = 4;
+  string path = 5;
+}
+
+message ModList {
+  repeated ModInfo mods = 1;
+}
+
+message InstallModRequest {
+  string source_path = 1;
+  string mod_name = 2;
+}
+
+message RemoveModRequest {
+  string mod_name = 1;
+}
+
+message ToggleModRequest {
+  string mod_name = 1;
+  bool enabled = 2;
+}
+
+message ServerMetrics {
+  double tps = 1;
+  int32 fps = 2;
+  int32 online_players = 3;
+  uint64 memory_used_mb = 4;
+  double cpu_percent = 5;
+  int64 network_in_bytes = 6;
+  int64 network_out_bytes = 7;
+  string timestamp = 8;
+}

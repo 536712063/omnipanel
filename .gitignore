@@ -90,7 +90,6 @@
 *.so
 *.test
 **/target/
-**/go.work
 **/Cargo.lock
 
 # Ruby

@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package omnipanel.agent.v1;
+
+option go_package = "github.com/omnipanel/omnipanel/proto/agent/v1;agentv1";
+
+import "common/v1/common.proto";
+
+// AgentInternal 是 Agent 主进程暴露给 UI 的管理接口
+service AgentInternal {
+  rpc GetSystemInfo(omnipanel.common.v1.Empty) returns (omnipanel.common.v1.SystemInfo);
+  rpc GetPluginStatus(omnipanel.common.v1.Empty) returns (PluginStatusList);
+  rpc RestartPlugin(RestartPluginRequest) returns (omnipanel.common.v1.StatusResponse);
+  rpc ValidateLicense(LicenseKey) returns (LicenseStatus);
+  rpc ActivateLicense(ActivateLicenseRequest) returns (LicenseStatus);
+}
+
+message PluginStatus {
+  string name = 1;
+  string version = 2;
+  bool running = 3;
+  int32 pid = 4;
+  string uptime = 5;
+  uint64 memory_mb = 6;
+}
+
+message PluginStatusList {
+  repeated PluginStatus plugins = 1;
+}
+
+message RestartPluginRequest {
+  string plugin_name = 1;
+}
+
+message LicenseKey {
+  string key = 1;
+}
+
+message LicenseStatus {
+  bool valid = 1;
+  string plan = 2;
+  int64 expires_at = 3;
+  int32 days_remaining = 4;
+  string fingerprint = 5;
+  repeated string features = 6;
+  string message = 7;
+}
+
+message ActivateLicenseRequest {
+  string key = 1;
+  string email = 2;
+}

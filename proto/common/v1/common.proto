@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package omnipanel.common.v1;
+
+option go_package = "github.com/omnipanel/omnipanel/proto/common/v1;commonv1";
+
+message Empty {}
+
+message StatusResponse {
+  bool ok = 1;
+  string message = 2;
+  int32 code = 3;
+}
+
+message StreamRequest {
+  string session_id = 1;
+}
+
+message LogEntry {
+  string timestamp = 1;
+  string level = 2;
+  string message = 3;
+  string source = 4;
+  map<string, string> metadata = 5;
+}
+
+message SystemInfo {
+  string hostname = 1;
+  string platform = 2;
+  string arch = 3;
+  uint64 total_memory = 4;
+  uint64 free_memory = 5;
+  double cpu_usage = 6;
+  double memory_usage = 7;
+  uint64 uptime_seconds = 8;
+}
