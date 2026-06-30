@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "description": "OmniPanel - 一体化服务器&游戏管理桌面应用",
-  "main": "dist-electron/main.js",
+  "main": "out/main/index.js",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build && electron-builder",
+    "build": "electron-vite build && electron-builder",
     "preview": "vite preview",
     "server": "tsx server/index.ts",
     "dev:all": "concurrently \"npm run dev\" \"npm run server\""
@@ -72,6 +72,10 @@
     "directories": {
       "output": "release"
     },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
     "win": {
       "target": "nsis",
       "icon": "build/icon.ico"

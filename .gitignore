@@ -173,3 +173,7 @@
 *.lz
 *.lzma
 *.iso
+
+# Build output
+out/
+release/

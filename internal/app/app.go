@@ -1,13 +1,3 @@
-// Package app 定义 Wails v3 应用的核心结构和前端绑定方法。
-//
-// 架构:
-//   Vue 3 前端通过 Wails Runtime 调用此处的导出方法。
-//   每个方法对应一个 UI 操作，方法内部通过 gRPC 调用相应的插件。
-//
-// 安全:
-//   - 所有绑定方法必须验证调用来源 (通过 Wails context)
-//   - 敏感操作记录审计日志
-//   - 参数校验防止注入攻击
 package app
 
 import (
@@ -23,23 +13,38 @@ import (
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/omnipanel/omnipanel/internal/agent"
+	"github.com/omnipanel/omnipanel/internal/ai"
+	"github.com/omnipanel/omnipanel/internal/browser"
+	"github.com/omnipanel/omnipanel/internal/cloud"
+	"github.com/omnipanel/omnipanel/internal/common"
+	"github.com/omnipanel/omnipanel/internal/dtd"
+	"github.com/omnipanel/omnipanel/internal/git"
+	"github.com/omnipanel/omnipanel/internal/i18n"
 	"github.com/omnipanel/omnipanel/internal/license"
+	"github.com/omnipanel/omnipanel/internal/plugins"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
-// OmniPanel 是 Wails 应用的主结构体。
-// 所有标记为导出的方法将自动绑定为前端可调用的 API。
 type OmniPanel struct {
-	ctx       context.Context
-	pluginMgr *agent.Manager
-	licenser  *license.Licenser
-	wsHub     *WebSocketHub
-	logger    hclog.Logger
-	mu        sync.RWMutex
+	ctx          context.Context
+	pluginMgr    *agent.Manager
+	licenser     *license.Licenser
+	wsHub        *WebSocketHub
+	logger       hclog.Logger
+
+	aiSvc        *ai.Service
+	cloudSvc     *cloud.Service
+	dtdSvc       *dtd.Service
+	gitSvc       *git.Service
+	i18nSvc      *i18n.Service
+	browserSvc   *browser.Service
+	appLogger    *common.Logger
+	pluginMarket *plugins.Marketplace
+	configSync   *common.ConfigSync
+
+	mu sync.RWMutex
 }
 
-// NewOmniPanel 创建应用实例。
-// 该函数在 main.go 中调用，传入 Wails application context。
 func NewOmniPanel() *OmniPanel {
 	logger := hclog.New(&hclog.LoggerOptions{
 		Name:   "omnipanel",
@@ -64,13 +69,10 @@ func NewOmniPanel() *OmniPanel {
 	}
 }
 
-// Startup 由 Wails 在应用启动时调用。
-// 用于初始化插件系统、校验 License、启动 WebSocket 服务。
 func (a *OmniPanel) Startup(ctx context.Context) {
 	a.ctx = ctx
 	a.logger.Info("OmniPanel 正在启动...")
 
-	// 1. 校验 License (宽限策略: 即使失效也允许使用基本功能)
 	status, err := a.licenser.Validate("")
 	if err != nil {
 		a.logger.Warn("License 校验失败", "error", err)
@@ -78,21 +80,19 @@ func (a *OmniPanel) Startup(ctx context.Context) {
 		a.logger.Info("License 状态", "plan", status.Plan, "days_remaining", status.DaysRemaining)
 	}
 
-	// 2. 启动核心插件
+	a.initializeServices(ctx)
 	a.startPlugins(ctx)
-
-	// 3. 启动 WebSocket 服务 (用于实时推流)
 	go a.wsHub.Run(ctx)
-
-	// 4. 监听系统信号实现优雅关闭
 	go a.handleShutdown(ctx)
 
 	a.logger.Info("OmniPanel 启动完成")
 }
 
-// Shutdown 由 Wails 在应用退出时调用。
 func (a *OmniPanel) Shutdown(ctx context.Context) {
 	a.logger.Info("OmniPanel 正在关闭...")
+	if a.dtdSvc != nil {
+		a.dtdSvc.Stop()
+	}
 	if err := a.pluginMgr.ShutdownAll(30 * time.Second); err != nil {
 		a.logger.Error("插件关闭超时", "error", err)
 	}
@@ -100,124 +100,408 @@ func (a *OmniPanel) Shutdown(ctx context.Context) {
 	a.logger.Info("OmniPanel 已关闭")
 }
 
+func (a *OmniPanel) initializeServices(ctx context.Context) {
+	wailsEmitter := &WailsEventsEmitter{ctx: ctx}
+
+	a.appLogger, _ = common.NewLogger(getDataDir() + "/logs")
+
+	aiProvider := ai.NewOpenAICompatibleProvider(ai.ProviderConfig{
+		Name:    "openai",
+		BaseURL: os.Getenv("OPENAI_BASE_URL"),
+		APIKey:  os.Getenv("OPENAI_API_KEY"),
+		Model:   "gpt-4o",
+	})
+	a.aiSvc = ai.NewService(aiProvider, wailsEmitter)
+
+	a.cloudSvc = cloud.NewService(wailsEmitter, cloud.NewMultiMachineAdapter(nil, nil))
+
+	dtdBridge := &dtdBridgeAdapter{}
+	a.dtdSvc = dtd.NewService(wailsEmitter, dtdBridge)
+
+	a.gitSvc = git.NewService()
+	a.i18nSvc = i18n.NewService()
+	a.browserSvc = browser.NewService()
+
+	a.pluginMarket = plugins.NewMarketplace(getDataDir() + "/plugins")
+	_ = a.pluginMarket.LoadFromDir()
+
+	localStore := common.NewLocalConfigStore(getDataDir() + "/config.json")
+	a.configSync = common.NewConfigSync(localStore, nil, common.CloudSyncConfig{})
+}
+
+type WailsEventsEmitter struct {
+	ctx context.Context
+}
+
+func (e *WailsEventsEmitter) EmitEvent(eventName string, optionalData ...interface{}) {
+	app := application.Get(e.ctx)
+	if app != nil {
+		app.EmitEvent(eventName, optionalData...)
+	}
+}
+
+type dtdBridgeAdapter struct{}
+
+func (b *dtdBridgeAdapter) ExecuteCommand(ctx context.Context, machineID, command string) (string, error) {
+	return "", fmt.Errorf("multi-machine bridge not configured")
+}
+func (b *dtdBridgeAdapter) UploadToMachine(ctx context.Context, machineID, localPath, remotePath string) error {
+	return fmt.Errorf("multi-machine bridge not configured")
+}
+func (b *dtdBridgeAdapter) DownloadFromMachine(ctx context.Context, machineID, remotePath, localPath string) error {
+	return fmt.Errorf("multi-machine bridge not configured")
+}
+
 // ===========================================================================
-// 前端绑定方法 — License
+// License
 // ===========================================================================
 
-// GetLicenseStatus 返回当前 License 状态。
-// 前端在启动时调用此方法决定显示哪些功能模块。
 func (a *OmniPanel) GetLicenseStatus() (*license.LicenseStatus, error) {
 	return a.licenser.Validate("")
 }
 
-// ActivateLicense 激活 License Key。
 func (a *OmniPanel) ActivateLicense(licenseKey, email string) (*license.LicenseStatus, error) {
 	return a.licenser.Activate(licenseKey, email)
 }
 
 // ===========================================================================
-// 前端绑定方法 — 系统信息
+// System
 // ===========================================================================
 
-// GetSystemInfo 获取本地机器信息 (CPU/内存/磁盘/网络)。
 func (a *OmniPanel) GetSystemInfo() (map[string]interface{}, error) {
 	return collectSystemInfo()
 }
 
-// GetProcessList 获取进程列表。
 func (a *OmniPanel) GetProcessList() ([]map[string]interface{}, error) {
 	return getProcessList()
 }
 
 // ===========================================================================
-// 前端绑定方法 — SDTD (七日杀)
+// AI Assistant
 // ===========================================================================
 
-// SDTDInstallServer 安装七日杀服务端 (通过 SteamCMD)。
-// 返回一个任务 ID，前端通过 WebSocket 接收实时安装日志。
-func (a *OmniPanel) SDTDInstallServer(installDir, steamUser, steamPass string) (string, error) {
-	taskID := fmt.Sprintf("sdt-install-%d", time.Now().UnixNano())
-	go func() {
-		// 实际调用 SDTD 插件 gRPC 接口
-		// client := sdtv1.NewSDTServiceClient(conn)
-		// stream, _ := client.InstallServer(ctx, &sdtv1.InstallServerRequest{...})
-		// for { line, _ := stream.Recv(); a.wsHub.Broadcast(taskID, line) }
-		a.wsHub.Broadcast(taskID, map[string]string{
-			"status":  "running",
-			"message": "正在通过 SteamCMD 下载七日杀服务端...",
-		})
-	}()
-	return taskID, nil
+func (a *OmniPanel) AIChat(chatReq ai.ChatRequest) (ai.ChatResponse, error) {
+	return a.aiSvc.SendMessage(chatReq)
 }
 
-// SDTDStartServer 启动七日杀服务端。
-func (a *OmniPanel) SDTDStartServer() (map[string]interface{}, error) {
-	// 实际调用 SDTD 插件 gRPC 接口
-	return map[string]interface{}{
-		"success": true,
-		"message": "七日杀服务端启动指令已发送",
-	}, nil
+func (a *OmniPanel) AIChatStream(chatReq ai.ChatRequest) error {
+	return a.aiSvc.SendMessageStream(chatReq)
 }
 
-// SDTDStopServer 停止七日杀服务端。
-func (a *OmniPanel) SDTDStopServer() (map[string]interface{}, error) {
-	return map[string]interface{}{
-		"success": true,
-		"message": "七日杀服务端停止指令已发送",
-	}, nil
+func (a *OmniPanel) AIUploadFile(name string, data []byte) (ai.ContentPart, error) {
+	return a.aiSvc.UploadFile(name, data)
 }
 
-// SDTDGetServerConfig 获取 serverconfig.xml 内容。
-func (a *OmniPanel) SDTDGetServerConfig() (map[string]interface{}, error) {
-	// 实际调用 SDTD 插件 gRPC 接口
-	return map[string]interface{}{
-		"serverName":        "OmniPanel 七日杀服务器",
-		"serverPort":        26900,
-		"maxPlayers":        16,
-		"gameDifficulty":    4,
-		"worldGenSeed":      "OmniPanel2026",
-		"eacEnabled":        true,
-		"bloodMoonFrequency": 7,
-	}, nil
-}
-
-// SDTDSaveServerConfig 保存并应用 serverconfig.xml。
-func (a *OmniPanel) SDTDSaveServerConfig(config map[string]interface{}) (map[string]interface{}, error) {
-	return map[string]interface{}{
-		"success": true,
-		"message": "配置已保存",
-	}, nil
-}
-
-// SDTDSendConsoleCommand 向游戏控制台发送命令。
-func (a *OmniPanel) SDTDSendConsoleCommand(command string) (string, error) {
-	return fmt.Sprintf("命令 '%s' 已发送到游戏控制台", command), nil
-}
-
-// SDTDGetPlayers 获取玩家列表。
-func (a *OmniPanel) SDTDGetPlayers() ([]map[string]interface{}, error) {
-	return []map[string]interface{}{
-		{"name": "Survivor1", "steamId": "76561198123456789", "level": 45, "online": true},
-		{"name": "ZombieHunter", "steamId": "76561198234567890", "level": 32, "online": true},
-		{"name": "BaseBuilder", "steamId": "76561198345678901", "level": 78, "online": false},
-	}, nil
-}
-
-// SDTDCreateBackup 创建存档备份。
-func (a *OmniPanel) SDTDCreateBackup() (map[string]interface{}, error) {
-	timestamp := time.Now().Format("20060102_150405")
-	return map[string]interface{}{
-		"id":   timestamp,
-		"name": fmt.Sprintf("saves_%s.zip", timestamp),
-		"size": "1.2GB",
-	}, nil
+func (a *OmniPanel) AIGetHistory(sessionID string) []ai.ChatMessage {
+	return a.aiSvc.GetSessionHistory(sessionID)
 }
 
 // ===========================================================================
-// 前端绑定方法 — 插件管理
+// Cloud Storage
 // ===========================================================================
 
-// GetPluginStatus 返回所有插件的运行状态。
+func (a *OmniPanel) CloudListFiles(providerName, path string) ([]cloud.FileInfo, error) {
+	return a.cloudSvc.ListFiles(providerName, path)
+}
+
+func (a *OmniPanel) CloudCopyFile(providerName, srcPath, dstPath string) error {
+	return a.cloudSvc.CopyFile(providerName, srcPath, dstPath)
+}
+
+func (a *OmniPanel) CloudMoveFile(providerName, srcPath, dstPath string) error {
+	return a.cloudSvc.MoveFile(providerName, srcPath, dstPath)
+}
+
+func (a *OmniPanel) CloudRenameFile(providerName, path, newName string) error {
+	return a.cloudSvc.RenameFile(providerName, path, newName)
+}
+
+func (a *OmniPanel) CloudDeleteFile(providerName, path string) error {
+	return a.cloudSvc.DeleteFile(providerName, path)
+}
+
+func (a *OmniPanel) CloudMkdir(providerName, path string) error {
+	return a.cloudSvc.Mkdir(providerName, path)
+}
+
+func (a *OmniPanel) CloudUploadFile(providerName, localPath, remotePath string) (string, error) {
+	return a.cloudSvc.UploadFile(providerName, localPath, remotePath)
+}
+
+func (a *OmniPanel) CloudDownloadFile(providerName, remotePath, localPath string) (string, error) {
+	return a.cloudSvc.DownloadFile(providerName, remotePath, localPath)
+}
+
+func (a *OmniPanel) CloudGetPreview(providerName, path string) (cloud.PreviewInfo, error) {
+	return a.cloudSvc.GetPreview(providerName, path)
+}
+
+func (a *OmniPanel) CloudOAuthURL(providerName string) (string, error) {
+	return a.cloudSvc.OAuthURL(providerName)
+}
+
+func (a *OmniPanel) CloudHandleOAuthCallback(providerName, code, state string) (*cloud.OAuthToken, error) {
+	return a.cloudSvc.HandleOAuthCallback(providerName, code, state)
+}
+
+func (a *OmniPanel) CloudAddProvider(cfg cloud.ProviderConfig) error {
+	return a.cloudSvc.AddProviderFromConfig(cfg)
+}
+
+func (a *OmniPanel) CloudListProviders() []string {
+	return a.cloudSvc.ListProviders()
+}
+
+func (a *OmniPanel) CloudSyncFromMachine(req cloud.MultiMachineSyncRequest) (string, error) {
+	return a.cloudSvc.SyncFromMachine(req)
+}
+
+// ===========================================================================
+// 7DTD Server Management
+// ===========================================================================
+
+func (a *OmniPanel) DTDAddServer(cfg dtd.ServerConfig) error {
+	return a.dtdSvc.AddServer(cfg)
+}
+
+func (a *OmniPanel) DTDListServers() []dtd.ServerConfig {
+	return a.dtdSvc.ListServers()
+}
+
+func (a *OmniPanel) DTDConnect(serverID string) error {
+	return a.dtdSvc.Connect(serverID)
+}
+
+func (a *OmniPanel) DTDDisconnect(serverID string) error {
+	return a.dtdSvc.Disconnect(serverID)
+}
+
+func (a *OmniPanel) DTDSendCommand(serverID, cmd string) error {
+	return a.dtdSvc.SendCommand(serverID, cmd)
+}
+
+func (a *OmniPanel) DTDGetPlayers(serverID string) []dtd.OnlinePlayer {
+	return a.dtdSvc.GetPlayers(serverID)
+}
+
+func (a *OmniPanel) DTDGetPlayerEvents(serverID string, limit int) []dtd.PlayerEvent {
+	return a.dtdSvc.GetPlayerEvents(serverID, limit)
+}
+
+func (a *OmniPanel) DTDGetConsoleMessages(serverID string, limit int) []dtd.ConsoleMessage {
+	return a.dtdSvc.GetConsoleMessages(serverID, limit)
+}
+
+func (a *OmniPanel) DTDParseLogFile(serverID, logPath string) error {
+	return a.dtdSvc.ParseLogFile(serverID, logPath)
+}
+
+func (a *OmniPanel) DTDGetMapData(serverID string) (*dtd.MapData, error) {
+	return a.dtdSvc.GetMapData(serverID)
+}
+
+func (a *OmniPanel) DTDGetBloodMoonInfo(serverID string) (*dtd.BloodMoonInfo, error) {
+	return a.dtdSvc.GetBloodMoonInfo(serverID)
+}
+
+func (a *OmniPanel) DTDAddScheduledTask(task dtd.ScheduledTask) (*dtd.ScheduledTask, error) {
+	return a.dtdSvc.AddScheduledTask(task)
+}
+
+func (a *OmniPanel) DTDRemoveScheduledTask(taskID string) {
+	a.dtdSvc.RemoveScheduledTask(taskID)
+}
+
+func (a *OmniPanel) DTDGetScheduledTasks() []dtd.ScheduledTask {
+	return a.dtdSvc.GetScheduledTasks()
+}
+
+func (a *OmniPanel) DTDDeployToMachine(req dtd.RemoteDeployRequest) (*dtd.RemoteCommandResult, error) {
+	return a.dtdSvc.DeployToMachine(req)
+}
+
+func (a *OmniPanel) DTDStartRemoteServer(machineID, installedDir string) (*dtd.RemoteCommandResult, error) {
+	return a.dtdSvc.StartRemoteServer(machineID, installedDir)
+}
+
+// ===========================================================================
+// Git Repository Management
+// ===========================================================================
+
+func (a *OmniPanel) GitAddLocalRepo(path string) (*git.Repo, error) {
+	return a.gitSvc.AddLocalRepo(path)
+}
+
+func (a *OmniPanel) GitCloneRepo(req git.CloneRequest) (*git.Repo, error) {
+	return a.gitSvc.CloneRepo(req)
+}
+
+func (a *OmniPanel) GitListRepos() []git.Repo {
+	return a.gitSvc.ListRepos()
+}
+
+func (a *OmniPanel) GitRemoveRepo(id string) {
+	a.gitSvc.RemoveRepo(id)
+}
+
+func (a *OmniPanel) GitBranches(repoID string) ([]git.Branch, error) {
+	return a.gitSvc.Branches(repoID)
+}
+
+func (a *OmniPanel) GitLog(repoID string, limit int) ([]git.Commit, error) {
+	return a.gitSvc.Log(repoID, limit)
+}
+
+func (a *OmniPanel) GitStatus(repoID string) ([]git.StatusItem, error) {
+	return a.gitSvc.Status(repoID)
+}
+
+func (a *OmniPanel) GitPull(repoID string) error {
+	return a.gitSvc.Pull(a.ctx, repoID)
+}
+
+func (a *OmniPanel) GitPush(repoID string) error {
+	return a.gitSvc.Push(a.ctx, repoID)
+}
+
+func (a *OmniPanel) GitCommit(repoID, message string) (string, error) {
+	return a.gitSvc.Commit(repoID, message)
+}
+
+func (a *OmniPanel) GitCheckout(repoID, branchName string) error {
+	return a.gitSvc.Checkout(repoID, branchName)
+}
+
+func (a *OmniPanel) GitCreateBranch(repoID, name string) error {
+	return a.gitSvc.CreateBranch(repoID, name)
+}
+
+func (a *OmniPanel) GitGetRepoStats(repoID string) (map[string]interface{}, error) {
+	return a.gitSvc.GetRepoStats(repoID)
+}
+
+// ===========================================================================
+// I18n Tool
+// ===========================================================================
+
+func (a *OmniPanel) I18nExtract(req i18n.ExtractRequest) (*i18n.ExtractResult, error) {
+	return a.i18nSvc.Extract(req)
+}
+
+func (a *OmniPanel) I18nGenerateLocaleFile(items []i18n.ExtractedItem, locale, outputPath string) error {
+	return a.i18nSvc.GenerateLocaleFile(items, locale, outputPath)
+}
+
+func (a *OmniPanel) I18nPreviewTranslation(filePath string, items []i18n.ExtractedItem) (string, error) {
+	return a.i18nSvc.PreviewTranslation(filePath, items)
+}
+
+func (a *OmniPanel) I18nApplyTranslationFile(filePath string, items []i18n.ExtractedItem) error {
+	return a.i18nSvc.ApplyTranslationFile(filePath, items)
+}
+
+func (a *OmniPanel) I18nBatchApplyTranslation(result i18n.ExtractResult) error {
+	return a.i18nSvc.BatchApplyTranslation(result)
+}
+
+// ===========================================================================
+// Built-in Browser
+// ===========================================================================
+
+func (a *OmniPanel) BrowserGetInfo() browser.BrowserInfo {
+	return a.browserSvc.GetInfo()
+}
+
+func (a *OmniPanel) BrowserOpenExternalURL(url string) error {
+	return a.browserSvc.OpenExternalURL(a.ctx, url)
+}
+
+func (a *OmniPanel) BrowserValidateURL(url string) error {
+	return a.browserSvc.ValidateURL(url)
+}
+
+// ===========================================================================
+// Plugin Marketplace
+// ===========================================================================
+
+func (a *OmniPanel) PluginList() []plugins.Manifest {
+	return a.pluginMarket.ListPlugins()
+}
+
+func (a *OmniPanel) PluginExecute(id string, execCtx map[string]interface{}) (map[string]interface{}, error) {
+	return a.pluginMarket.ExecuteAgent(id, execCtx)
+}
+
+func (a *OmniPanel) PluginEnable(id string) {
+	a.pluginMarket.EnablePlugin(id)
+}
+
+func (a *OmniPanel) PluginDisable(id string) {
+	a.pluginMarket.DisablePlugin(id)
+}
+
+// ===========================================================================
+// Config Sync
+// ===========================================================================
+
+func (a *OmniPanel) ConfigGetSyncConfig() map[string]interface{} {
+	return a.configSync.GetSyncStatus()
+}
+
+func (a *OmniPanel) ConfigSaveSyncConfig(cfg common.CloudSyncConfig) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.configSync = common.NewConfigSync(a.configSync.GetLocalStore(), a.configSync.GetRemoteStore(), cfg)
+	return nil
+}
+
+func (a *OmniPanel) ConfigPullFromCloud() (map[string]interface{}, error) {
+	return a.configSync.PullFromCloud()
+}
+
+func (a *OmniPanel) ConfigPushToCloud() error {
+	return a.configSync.PushToCloud()
+}
+
+func (a *OmniPanel) ConfigGetLocal() (map[string]interface{}, error) {
+	return a.configSync.GetConfig()
+}
+
+func (a *OmniPanel) ConfigSetLocal(data map[string]interface{}) error {
+	return a.configSync.SetConfig(data)
+}
+
+// ===========================================================================
+// Settings / Theme
+// ===========================================================================
+
+func (a *OmniPanel) GetTheme() string {
+	return "dark"
+}
+
+func (a *OmniPanel) SetTheme(theme string) error {
+	a.logger.Info("主题切换", "theme", theme)
+	return nil
+}
+
+func (a *OmniPanel) GetSettings() (map[string]interface{}, error) {
+	return map[string]interface{}{
+		"theme":         "dark",
+		"language":      "zh-CN",
+		"sidebarOpen":   true,
+		"notifications": true,
+	}, nil
+}
+
+func (a *OmniPanel) SaveSettings(settings map[string]interface{}) error {
+	a.logger.Info("设置已保存")
+	return nil
+}
+
+// ===========================================================================
+// Plugin Status (keep legacy)
+// ===========================================================================
+
 func (a *OmniPanel) GetPluginStatus() ([]map[string]interface{}, error) {
 	plugins := a.pluginMgr.ListPlugins()
 	var result []map[string]interface{}
@@ -232,36 +516,8 @@ func (a *OmniPanel) GetPluginStatus() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
-// GetTheme 返回当前主题设置。
-func (a *OmniPanel) GetTheme() string {
-	return "dark"
-}
-
-// SetTheme 设置主题 (light/dark/auto)。
-func (a *OmniPanel) SetTheme(theme string) error {
-	a.logger.Info("主题切换", "theme", theme)
-	// 通过 Wails 事件发送给前端
-	return nil
-}
-
-// GetSettings 返回所有设置。
-func (a *OmniPanel) GetSettings() (map[string]interface{}, error) {
-	return map[string]interface{}{
-		"theme":         "dark",
-		"language":      "zh-CN",
-		"sidebarOpen":   true,
-		"notifications": true,
-	}, nil
-}
-
-// SaveSettings 保存设置。
-func (a *OmniPanel) SaveSettings(settings map[string]interface{}) error {
-	a.logger.Info("设置已保存")
-	return nil
-}
-
 // ===========================================================================
-// 内部辅助方法
+// Internal Helpers
 // ===========================================================================
 
 func (a *OmniPanel) startPlugins(ctx context.Context) {
@@ -319,13 +575,13 @@ func collectSystemInfo() (map[string]interface{}, error) {
 
 	hostname, _ := os.Hostname()
 	return map[string]interface{}{
-		"hostname":    hostname,
-		"platform":    runtime.GOOS,
-		"arch":        runtime.GOARCH,
-		"goVersion":   runtime.Version(),
-		"numCPU":      runtime.NumCPU(),
+		"hostname":     hostname,
+		"platform":     runtime.GOOS,
+		"arch":         runtime.GOARCH,
+		"goVersion":    runtime.Version(),
+		"numCPU":       runtime.NumCPU(),
 		"numGoroutine": runtime.NumGoroutine(),
-		"uptime":      time.Now().Unix(),
+		"uptime":       time.Now().Unix(),
 	}, nil
 }
 
@@ -336,15 +592,9 @@ func getProcessList() ([]map[string]interface{}, error) {
 }
 
 // ===========================================================================
-// Wails 应用服务创建
+// Wails Application Service Creation
 // ===========================================================================
 
-// CreateWailsService 配置 Wails v3 应用服务。
-// 该函数在 main.go 中调用，负责:
-//   1. 创建 Wails Application 实例
-//   2. 注册前端绑定方法
-//   3. 配置窗口参数
-//   4. 设置生命周期钩子
 func CreateWailsService(appInstance *OmniPanel) *application.App {
 	app := application.New(application.Options{
 		Name:        "OmniPanel",
@@ -355,27 +605,90 @@ func CreateWailsService(appInstance *OmniPanel) *application.App {
 		},
 	})
 
-	// 绑定 Go 方法到前端
-	// 在 Wails v3 中, 通过 app.Bind() 注册导出方法
 	app.Bind(appInstance.GetLicenseStatus)
 	app.Bind(appInstance.ActivateLicense)
 	app.Bind(appInstance.GetSystemInfo)
 	app.Bind(appInstance.GetProcessList)
-	app.Bind(appInstance.SDTDInstallServer)
-	app.Bind(appInstance.SDTDStartServer)
-	app.Bind(appInstance.SDTDStopServer)
-	app.Bind(appInstance.SDTDGetServerConfig)
-	app.Bind(appInstance.SDTDSaveServerConfig)
-	app.Bind(appInstance.SDTDSendConsoleCommand)
-	app.Bind(appInstance.SDTDGetPlayers)
-	app.Bind(appInstance.SDTDCreateBackup)
-	app.Bind(appInstance.GetPluginStatus)
+
+	app.Bind(appInstance.AIChat)
+	app.Bind(appInstance.AIChatStream)
+	app.Bind(appInstance.AIUploadFile)
+	app.Bind(appInstance.AIGetHistory)
+
+	app.Bind(appInstance.CloudListFiles)
+	app.Bind(appInstance.CloudCopyFile)
+	app.Bind(appInstance.CloudMoveFile)
+	app.Bind(appInstance.CloudRenameFile)
+	app.Bind(appInstance.CloudDeleteFile)
+	app.Bind(appInstance.CloudMkdir)
+	app.Bind(appInstance.CloudUploadFile)
+	app.Bind(appInstance.CloudDownloadFile)
+	app.Bind(appInstance.CloudGetPreview)
+	app.Bind(appInstance.CloudOAuthURL)
+	app.Bind(appInstance.CloudHandleOAuthCallback)
+	app.Bind(appInstance.CloudAddProvider)
+	app.Bind(appInstance.CloudListProviders)
+	app.Bind(appInstance.CloudSyncFromMachine)
+
+	app.Bind(appInstance.DTDAddServer)
+	app.Bind(appInstance.DTDListServers)
+	app.Bind(appInstance.DTDConnect)
+	app.Bind(appInstance.DTDDisconnect)
+	app.Bind(appInstance.DTDSendCommand)
+	app.Bind(appInstance.DTDGetPlayers)
+	app.Bind(appInstance.DTDGetPlayerEvents)
+	app.Bind(appInstance.DTDGetConsoleMessages)
+	app.Bind(appInstance.DTDParseLogFile)
+	app.Bind(appInstance.DTDGetMapData)
+	app.Bind(appInstance.DTDGetBloodMoonInfo)
+	app.Bind(appInstance.DTDAddScheduledTask)
+	app.Bind(appInstance.DTDRemoveScheduledTask)
+	app.Bind(appInstance.DTDGetScheduledTasks)
+	app.Bind(appInstance.DTDDeployToMachine)
+	app.Bind(appInstance.DTDStartRemoteServer)
+
+	app.Bind(appInstance.GitAddLocalRepo)
+	app.Bind(appInstance.GitCloneRepo)
+	app.Bind(appInstance.GitListRepos)
+	app.Bind(appInstance.GitRemoveRepo)
+	app.Bind(appInstance.GitBranches)
+	app.Bind(appInstance.GitLog)
+	app.Bind(appInstance.GitStatus)
+	app.Bind(appInstance.GitPull)
+	app.Bind(appInstance.GitPush)
+	app.Bind(appInstance.GitCommit)
+	app.Bind(appInstance.GitCheckout)
+	app.Bind(appInstance.GitCreateBranch)
+	app.Bind(appInstance.GitGetRepoStats)
+
+	app.Bind(appInstance.I18nExtract)
+	app.Bind(appInstance.I18nGenerateLocaleFile)
+	app.Bind(appInstance.I18nPreviewTranslation)
+	app.Bind(appInstance.I18nApplyTranslationFile)
+	app.Bind(appInstance.I18nBatchApplyTranslation)
+
+	app.Bind(appInstance.BrowserGetInfo)
+	app.Bind(appInstance.BrowserOpenExternalURL)
+	app.Bind(appInstance.BrowserValidateURL)
+
+	app.Bind(appInstance.PluginList)
+	app.Bind(appInstance.PluginExecute)
+	app.Bind(appInstance.PluginEnable)
+	app.Bind(appInstance.PluginDisable)
+
+	app.Bind(appInstance.ConfigGetSyncConfig)
+	app.Bind(appInstance.ConfigSaveSyncConfig)
+	app.Bind(appInstance.ConfigPullFromCloud)
+	app.Bind(appInstance.ConfigPushToCloud)
+	app.Bind(appInstance.ConfigGetLocal)
+	app.Bind(appInstance.ConfigSetLocal)
+
 	app.Bind(appInstance.GetTheme)
 	app.Bind(appInstance.SetTheme)
 	app.Bind(appInstance.GetSettings)
 	app.Bind(appInstance.SaveSettings)
+	app.Bind(appInstance.GetPluginStatus)
 
-	// 注册生命周期钩子
 	app.OnStartup(func(ctx context.Context, a *application.App) {
 		appInstance.Startup(ctx)
 	})
